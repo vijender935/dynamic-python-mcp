@@ -13,11 +13,14 @@ image = (
     )
 )
 
+# Google Drive secret (service account + folder IDs)
+GOOGLE_DRIVE_SECRET = modal.Secret.from_name("google-drive")
+
 
 def make_mcp_server():
     from fastmcp import FastMCP
 
-    mcp = FastMCP("Dynamic Python MCP (with pip install + H100)")
+    mcp = FastMCP("Dynamic Python MCP (with pip install + H100 + Google Drive)")
 
     @mcp.tool()
     async def run_python(
@@ -29,11 +32,12 @@ def make_mcp_server():
     ) -> str:
         """
         Run arbitrary Python code in a secure Modal Sandbox.
-        Supports dynamic package installation and optional GPU (including H100).
+        Supports dynamic package installation, optional GPU (including H100),
+        and has Google Drive secrets injected (GOOGLE_SERVICE_ACCOUNT_JSON, INPUT_FOLDER_ID, etc.).
 
         Args:
             code: The Python code to execute
-            packages: List of packages to install (e.g. ["torch", "transformers", "boto3"])
+            packages: List of packages to install (e.g. ["torch", "boto3", "google-api-python-client"])
             timeout_seconds: Max runtime in seconds (default 300)
             python_version: Python version to use (default "3.12")
             gpu: GPU type. Options: "T4", "L4", "A10G", "A100", "H100" (or None for CPU)
@@ -67,11 +71,11 @@ def make_mcp_server():
             else:
                 return f"Unsupported GPU: {gpu}. Supported: T4, L4, A10G, A100, H100"
 
-        # Create Sandbox (no context manager - not supported)
         sandbox_kwargs = {
             "image": sandbox_image,
             "timeout": timeout_seconds,
             "app": app,
+            "secrets": [GOOGLE_DRIVE_SECRET],
         }
         if gpu_config:
             sandbox_kwargs["gpu"] = gpu_config
@@ -99,7 +103,7 @@ def make_mcp_server():
     return mcp
 
 
-@app.function(image=image, timeout=600)
+@app.function(image=image, timeout=600, secrets=[GOOGLE_DRIVE_SECRET])
 @modal.asgi_app()
 def web():
     """MCP Server endpoint (Streamable HTTP)"""
