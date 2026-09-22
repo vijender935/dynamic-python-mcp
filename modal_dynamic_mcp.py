@@ -67,7 +67,7 @@ def make_mcp_server():
             else:
                 return f"Unsupported GPU: {gpu}. Supported: T4, L4, A10G, A100, H100"
 
-        # Create Sandbox
+        # Create Sandbox (no context manager - not supported)
         sandbox_kwargs = {
             "image": sandbox_image,
             "timeout": timeout_seconds,
@@ -76,7 +76,8 @@ def make_mcp_server():
         if gpu_config:
             sandbox_kwargs["gpu"] = gpu_config
 
-        with modal.Sandbox.create(**sandbox_kwargs) as sb:
+        sb = modal.Sandbox.create(**sandbox_kwargs)
+        try:
             process = sb.exec("python", "-c", code)
             process.wait()
 
@@ -92,6 +93,8 @@ def make_mcp_server():
                 output += f"\n[Exit code: {process.returncode}]"
 
             return output.strip() or "(no output)"
+        finally:
+            sb.terminate()
 
     return mcp
 
