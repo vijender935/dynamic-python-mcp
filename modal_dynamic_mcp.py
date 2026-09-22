@@ -3,7 +3,6 @@ from typing import Optional, List
 
 app = modal.App("dynamic-python-mcp")
 
-# Base image for the MCP server itself
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install(
@@ -13,7 +12,6 @@ image = (
     )
 )
 
-# Google Drive secret (service account + folder IDs)
 GOOGLE_DRIVE_SECRET = modal.Secret.from_name("google-drive")
 
 
@@ -29,47 +27,42 @@ def make_mcp_server():
         timeout_seconds: int = 300,
         python_version: str = "3.12",
         gpu: Optional[str] = None,
+        wait: bool = True,
     ) -> str:
         """
-        Run arbitrary Python code in a secure Modal Sandbox.
-        Supports dynamic package installation, optional GPU (including H100),
-        and has Google Drive secrets injected (GOOGLE_SERVICE_ACCOUNT_JSON, INPUT_FOLDER_ID, etc.).
+        Run arbitrary Python code in a Modal Sandbox.
 
         Args:
-            code: The Python code to execute
-            packages: List of packages to install (e.g. ["torch", "boto3", "google-api-python-client"])
-            timeout_seconds: Max runtime in seconds (default 300)
-            python_version: Python version to use (default "3.12")
-            gpu: GPU type. Options: "T4", "L4", "A10G", "A100", "H100" (or None for CPU)
+            code: Python code to execute
+            packages: pip packages to install
+            timeout_seconds: max sandbox lifetime (default 300)
+            python_version: e.g. "3.12"
+            gpu: "T4" | "L4" | "A10G" | "A100" | "H100" | None
+            wait: if True, wait for result; if False, fire-and-forget (job keeps running in backend)
 
         Returns:
-            stdout + stderr from the execution
+            stdout/stderr when wait=True, or sandbox id when wait=False
         """
         import modal
 
         packages = packages or []
 
-        # Create image with requested packages
         sandbox_image = modal.Image.debian_slim(python_version=python_version)
         if packages:
             sandbox_image = sandbox_image.pip_install(*packages)
 
-        # GPU mapping
         gpu_config = None
         if gpu:
-            gpu = gpu.upper().strip()
-            if gpu in ["H100", "H100!"]:
-                gpu_config = "H100"
-            elif gpu in ["A100", "A100-80GB"]:
-                gpu_config = "A100"
-            elif gpu in ["A10G", "A10"]:
-                gpu_config = "A10G"
-            elif gpu in ["L4"]:
-                gpu_config = "L4"
-            elif gpu in ["T4"]:
-                gpu_config = "T4"
-            else:
-                return f"Unsupported GPU: {gpu}. Supported: T4, L4, A10G, A100, H100"
+            g = gpu.upper().strip()
+            mapping = {
+                "H100": "H100", "H100!": "H100",
+                "A100": "A100", "A100-80GB": "A100",
+                "A10G": "A10G", "A10": "A10G",
+                "L4": "L4", "T4": "T4",
+            }
+            if g not in mapping:
+                return f"Unsupported GPU: {gpu}. Use T4, L4, A10G, A100, H100"
+            gpu_config = mapping[g]
 
         sandbox_kwargs = {
             "image": sandbox_image,
@@ -81,13 +74,23 @@ def make_mcp_server():
             sandbox_kwargs["gpu"] = gpu_config
 
         sb = modal.Sandbox.create(**sandbox_kwargs)
-        try:
-            process = sb.exec("python", "-c", code)
-            process.wait()
+        process = sb.exec("python", "-c", code)
 
+        # Fire-and-forget: detach, backend keeps running
+        if not wait:
+            sb.detach()
+            return (
+                f"Started (fire-and-forget)\n"
+                f"sandbox_id={sb.object_id}\n"
+                f"timeout_seconds={timeout_seconds}\n"
+                f"gpu={gpu_config or 'cpu'}\n"
+                f"Job is running in backend. Check Modal dashboard for logs."
+            )
+
+        try:
+            process.wait()
             stdout = process.stdout.read()
             stderr = process.stderr.read()
-
             output = ""
             if stdout:
                 output += f"=== STDOUT ===\n{stdout}\n"
@@ -95,7 +98,6 @@ def make_mcp_server():
                 output += f"=== STDERR ===\n{stderr}\n"
             if process.returncode != 0:
                 output += f"\n[Exit code: {process.returncode}]"
-
             return output.strip() or "(no output)"
         finally:
             sb.terminate()
@@ -106,13 +108,10 @@ def make_mcp_server():
 @app.function(image=image, timeout=600, secrets=[GOOGLE_DRIVE_SECRET])
 @modal.asgi_app()
 def web():
-    """MCP Server endpoint (Streamable HTTP)"""
     from fastapi import FastAPI
 
     mcp = make_mcp_server()
     mcp_app = mcp.http_app(transport="streamable-http", stateless_http=True)
-
     fastapi_app = FastAPI(lifespan=mcp_app.router.lifespan_context)
     fastapi_app.mount("/", mcp_app)
-
     return fastapi_app
