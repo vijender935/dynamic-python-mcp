@@ -1,6 +1,8 @@
 import modal
 from typing import Optional, List
 
+APP_VERSION = "2026-09-23-mcp-fix-1"
+
 app = modal.App("dynamic-python-mcp")
 
 image = (
@@ -38,7 +40,7 @@ def make_mcp_server():
             timeout_seconds: max sandbox lifetime (default 300)
             python_version: e.g. "3.12"
             gpu: "T4" | "L4" | "A10G" | "A100" | "H100" | None
-            wait: if True, wait for result; if False, fire-and-forget (job keeps running in backend)
+            wait: if True, wait for result; if False, fire-and-forget
 
         Returns:
             stdout/stderr when wait=True, or sandbox id when wait=False
@@ -76,7 +78,6 @@ def make_mcp_server():
         sb = modal.Sandbox.create(**sandbox_kwargs)
         process = sb.exec("python", "-c", code)
 
-        # Fire-and-forget: detach, backend keeps running
         if not wait:
             sb.detach()
             return (
@@ -102,6 +103,8 @@ def make_mcp_server():
         finally:
             sb.terminate()
 
+    # Keep this return at the factory level, outside run_python().
+    # The deployed Modal service must receive the FastMCP instance.
     return mcp
 
 
@@ -111,7 +114,23 @@ def web():
     from fastapi import FastAPI
 
     mcp = make_mcp_server()
-    mcp_app = mcp.http_app(transport="streamable-http", stateless_http=True)
-    fastapi_app = FastAPI(lifespan=mcp_app.router.lifespan_context)
+
+    if mcp is None:
+        raise RuntimeError(
+            f"make_mcp_server() returned None. "
+            f"Deployment version: {APP_VERSION}"
+        )
+
+    print(f"Starting Dynamic Python MCP {APP_VERSION}")
+
+    mcp_app = mcp.http_app(
+        transport="streamable-http",
+        stateless_http=True,
+    )
+
+    fastapi_app = FastAPI(
+        lifespan=mcp_app.router.lifespan_context
+    )
     fastapi_app.mount("/", mcp_app)
+
     return fastapi_app
