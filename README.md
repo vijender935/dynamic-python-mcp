@@ -9,18 +9,12 @@ Modal-based MCP server jo Claude ko **kahin bhi Python code chalane** deta hai, 
 - GPU: `T4`, `L4`, `A10G`, `A100` (40GB), `A100-40GB`, `A100-80GB`, `L40S`, `H100`, `H100!`, `H200`, `B200`
 - Do modes: `wait=True` (result turant) aur `wait=False` (fire-and-forget)
 - Code khatam hote hi sandbox **apne aap band** hota hai (idle GPU ka bill nahi)
-- Secret URL (token) + `max_containers` limit
+- `max_containers` limit
 
 ## One-time setup
 
 1. Modal secret **`google-drive`**: Drive credentials (sirf sandbox ko milta hai).
-2. Modal secret **`mcp-auth`** with key `MCP_PATH_TOKEN` (16+ random chars):
-   ```bash
-   python -c "import secrets;print(secrets.token_urlsafe(24))"
-   modal secret create mcp-auth MCP_PATH_TOKEN=<string>
-   ```
-   (Ya Modal dashboard > Secrets > Create new secret > Custom.)
-3. GitHub repo secrets: `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`.
+2. GitHub repo secrets: `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`.
 
 ## Deploy
 
@@ -35,10 +29,8 @@ modal deploy modal_dynamic_mcp.py
 Claude mein **Streamable HTTP** MCP server ke roop mein ye URL add karo:
 
 ```
-https://<workspace>--dynamic-python-mcp-web.modal.run/<MCP_PATH_TOKEN>/mcp
+https://<workspace>--dynamic-python-mcp-web.modal.run/mcp
 ```
-
-URL ko password ki tarah private rakho. Bina token ke `/mcp` 404 deta hai.
 
 ## Tool: `run_python`
 
