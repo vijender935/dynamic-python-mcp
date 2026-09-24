@@ -4,7 +4,7 @@ import asyncio
 import modal
 from typing import Optional, List
 
-APP_VERSION = "2026-09-24-fixes-1"
+APP_VERSION = "2026-09-24-no-auth"
 
 # ---------- Limits ----------
 MAX_WAIT_SECONDS = 540       # wait=True cap (web function ke 600s timeout se pehle)
@@ -21,10 +21,10 @@ GPU_MAP = {
     "A10G": "A10G",
     "A100": "A100",
     "A100-40GB": "A100-40GB",
-    "A100-80GB": "A100-80GB",  # pehle galti se "A100" (40GB) ban jaata tha
+    "A100-80GB": "A100-80GB",
     "L40S": "L40S",
     "H100": "H100",
-    "H100!": "H100!",          # "!" = H200 pe auto-upgrade nahi hoga
+    "H100!": "H100!",
     "H200": "H200",
     "B200": "B200",
 }
@@ -42,8 +42,6 @@ image = (
 
 # Drive credentials sirf sandbox ko milte hain (web function ko nahi)
 GOOGLE_DRIVE_SECRET = modal.Secret.from_name("google-drive")
-# MCP_PATH_TOKEN is secret se aata hai (URL ka secret hissa)
-AUTH_SECRET = modal.Secret.from_name("mcp-auth")
 
 
 def _clip(text, limit=None):
@@ -183,8 +181,6 @@ def make_mcp_server():
 
         return "\n".join(notes + [result])
 
-    # Ye return factory level pe hi rahe (run_python ke andar nahi).
-    # Deployed Modal service ko FastMCP instance chahiye.
     return mcp
 
 
@@ -192,18 +188,10 @@ def make_mcp_server():
     image=image,
     timeout=600,
     max_containers=MAX_CONTAINERS,
-    secrets=[AUTH_SECRET],
 )
 @modal.asgi_app()
 def web():
     from fastapi import FastAPI
-
-    token = os.environ.get("MCP_PATH_TOKEN", "").strip()
-    if len(token) < 16:
-        raise RuntimeError(
-            "MCP_PATH_TOKEN missing ya bahut chhota hai. "
-            "Modal secret 'mcp-auth' mein MCP_PATH_TOKEN (16+ chars) daalo."
-        )
 
     mcp = make_mcp_server()
 
@@ -215,9 +203,9 @@ def web():
 
     print(f"Starting Dynamic Python MCP {APP_VERSION}")
 
-    # Endpoint: /<token>/mcp  (bina token ke /mcp 404 dega)
+    # Endpoint: /mcp (no token required)
     mcp_app = mcp.http_app(
-        path=f"/{token}/mcp",
+        path="/mcp",
         transport="streamable-http",
         stateless_http=True,
     )
