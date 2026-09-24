@@ -1,7 +1,33 @@
+import os
+import time
+import asyncio
 import modal
 from typing import Optional, List
 
-APP_VERSION = "2026-09-23-mcp-fix-1"
+APP_VERSION = "2026-09-24-fixes-1"
+
+# ---------- Limits ----------
+MAX_WAIT_SECONDS = 540       # wait=True cap (web function ke 600s timeout se pehle)
+MIN_TIMEOUT_SECONDS = 10     # Modal sandbox ka minimum timeout
+MAX_TIMEOUT_SECONDS = 86400  # sandbox ki max life: 24 ghante
+MAX_OUTPUT_CHARS = 20000     # isse bada output truncate hota hai
+MAX_CONTAINERS = 5           # ek saath max containers (bill / abuse control)
+
+# User ka GPU naam -> Modal GPU string
+GPU_MAP = {
+    "T4": "T4",
+    "L4": "L4",
+    "A10": "A10G",
+    "A10G": "A10G",
+    "A100": "A100",
+    "A100-40GB": "A100-40GB",
+    "A100-80GB": "A100-80GB",  # pehle galti se "A100" (40GB) ban jaata tha
+    "L40S": "L40S",
+    "H100": "H100",
+    "H100!": "H100!",          # "!" = H200 pe auto-upgrade nahi hoga
+    "H200": "H200",
+    "B200": "B200",
+}
 
 app = modal.App("dynamic-python-mcp")
 
@@ -14,13 +40,23 @@ image = (
     )
 )
 
+# Drive credentials sirf sandbox ko milte hain (web function ko nahi)
 GOOGLE_DRIVE_SECRET = modal.Secret.from_name("google-drive")
+# MCP_PATH_TOKEN is secret se aata hai (URL ka secret hissa)
+AUTH_SECRET = modal.Secret.from_name("mcp-auth")
+
+
+def _clip(text, limit=None):
+    limit = limit or MAX_OUTPUT_CHARS
+    if len(text) > limit:
+        return "...[truncated]...\n" + text[-limit:]
+    return text
 
 
 def make_mcp_server():
     from fastmcp import FastMCP
 
-    mcp = FastMCP("Dynamic Python MCP (with pip install + H100 + Google Drive)")
+    mcp = FastMCP("Dynamic Python MCP (pip install + GPU + Google Drive)")
 
     @mcp.tool()
     async def run_python(
@@ -32,86 +68,142 @@ def make_mcp_server():
         wait: bool = True,
     ) -> str:
         """
-        Run arbitrary Python code in a Modal Sandbox.
+        Run arbitrary Python code in a Modal Sandbox (dynamic pip install + optional GPU).
 
         Args:
             code: Python code to execute
-            packages: pip packages to install
-            timeout_seconds: max sandbox lifetime (default 300)
+            packages: pip packages to install (e.g. ["torch", "numpy"])
+            timeout_seconds: sandbox max life in seconds (default 300, min 10, max 86400).
+                With wait=True it is capped at 540s.
             python_version: e.g. "3.12"
-            gpu: "T4" | "L4" | "A10G" | "A100" | "H100" | None
-            wait: if True, wait for result; if False, fire-and-forget
+            gpu: "T4" | "L4" | "A10G" | "A100" | "A100-40GB" | "A100-80GB" |
+                 "L40S" | "H100" | "H100!" | "H200" | "B200" | None (CPU)
+            wait: True = wait for the result (short jobs, up to ~9 min).
+                  False = fire-and-forget for long jobs; the sandbox stops by
+                  itself as soon as the code finishes.
 
         Returns:
-            stdout/stderr when wait=True, or sandbox id when wait=False
+            stdout/stderr when wait=True (very long output is truncated to the
+            last 20000 chars), or the sandbox id when wait=False
         """
-        import modal
-
+        started = time.monotonic()
+        notes = []
         packages = packages or []
 
-        sandbox_image = modal.Image.debian_slim(python_version=python_version)
-        if packages:
-            sandbox_image = sandbox_image.pip_install(*packages)
-
-        gpu_config = None
-        if gpu:
-            g = gpu.upper().strip()
-            mapping = {
-                "H100": "H100", "H100!": "H100",
-                "A100": "A100", "A100-80GB": "A100",
-                "A10G": "A10G", "A10": "A10G",
-                "L4": "L4", "T4": "T4",
-            }
-            if g not in mapping:
-                return f"Unsupported GPU: {gpu}. Use T4, L4, A10G, A100, H100"
-            gpu_config = mapping[g]
-
-        sandbox_kwargs = {
-            "image": sandbox_image,
-            "timeout": timeout_seconds,
-            "app": app,
-            "secrets": [GOOGLE_DRIVE_SECRET],
-        }
-        if gpu_config:
-            sandbox_kwargs["gpu"] = gpu_config
-
-        sb = modal.Sandbox.create(**sandbox_kwargs)
-        process = sb.exec("python", "-c", code)
-
-        if not wait:
-            sb.detach()
-            return (
-                f"Started (fire-and-forget)\n"
-                f"sandbox_id={sb.object_id}\n"
-                f"timeout_seconds={timeout_seconds}\n"
-                f"gpu={gpu_config or 'cpu'}\n"
-                f"Job is running in backend. Check Modal dashboard for logs."
+        # ---- timeout limits ----
+        try:
+            timeout_seconds = int(timeout_seconds)
+        except (TypeError, ValueError):
+            timeout_seconds = 300
+        if timeout_seconds > MAX_TIMEOUT_SECONDS:
+            timeout_seconds = MAX_TIMEOUT_SECONDS
+            notes.append(f"⚠️ timeout_seconds max {MAX_TIMEOUT_SECONDS}s pe limit hua.")
+        timeout_seconds = max(MIN_TIMEOUT_SECONDS, timeout_seconds)
+        if wait and timeout_seconds > MAX_WAIT_SECONDS:
+            timeout_seconds = MAX_WAIT_SECONDS
+            notes.append(
+                f"⚠️ wait=True mein timeout {MAX_WAIT_SECONDS}s pe limit hua. "
+                "Lamba kaam ho to wait=False use karo."
             )
 
+        # ---- GPU ----
+        gpu_config = None
+        if gpu:
+            gpu_config = GPU_MAP.get(gpu.upper().strip())
+            if gpu_config is None:
+                return f"Unsupported GPU: {gpu}. Use: {', '.join(GPU_MAP)}"
+
+        # ---- sandbox: code hi entrypoint hai, khatam hote hi sandbox band ----
         try:
-            process.wait()
-            stdout = process.stdout.read()
-            stderr = process.stderr.read()
+            sandbox_image = modal.Image.debian_slim(python_version=python_version)
+            if packages:
+                sandbox_image = sandbox_image.pip_install(*packages)
+
+            kwargs = {
+                "image": sandbox_image,
+                "timeout": timeout_seconds,
+                "app": app,
+                "secrets": [GOOGLE_DRIVE_SECRET],
+            }
+            if gpu_config:
+                kwargs["gpu"] = gpu_config
+
+            sb = await modal.Sandbox.create.aio("python", "-c", code, **kwargs)
+        except Exception as e:
+            return (
+                "❌ Sandbox start nahi hua (packages / python_version / gpu check karo):\n"
+                + _clip(str(e), 3000)
+            )
+
+        # ---- fire-and-forget ----
+        if not wait:
+            sandbox_id = sb.object_id
+            try:
+                await sb.detach.aio()
+            except Exception:
+                pass
+            return "\n".join(
+                notes
+                + [
+                    "Started (fire-and-forget)",
+                    f"sandbox_id={sandbox_id}",
+                    f"timeout_seconds={timeout_seconds}",
+                    f"gpu={gpu_config or 'cpu'}",
+                    "Code khatam hote hi sandbox apne aap band ho jayega.",
+                    "Logs: Modal dashboard.",
+                ]
+            )
+
+        # ---- wait for result ----
+        try:
+            remaining = max(5.0, MAX_WAIT_SECONDS - (time.monotonic() - started))
+            await asyncio.wait_for(sb.wait.aio(), timeout=remaining)
+            stdout = await sb.stdout.read.aio()
+            stderr = await sb.stderr.read.aio()
             output = ""
             if stdout:
                 output += f"=== STDOUT ===\n{stdout}\n"
             if stderr:
                 output += f"=== STDERR ===\n{stderr}\n"
-            if process.returncode != 0:
-                output += f"\n[Exit code: {process.returncode}]"
-            return output.strip() or "(no output)"
+            if sb.returncode not in (0, None):
+                output += f"\n[Exit code: {sb.returncode}]"
+            result = _clip(output.strip() or "(no output)")
+        except asyncio.TimeoutError:
+            result = (
+                f"⏱️ {MAX_WAIT_SECONDS}s ki limit pe band kiya. "
+                "Lamba kaam ho to wait=False use karo."
+            )
+        except Exception as e:
+            result = "❌ Run fail ya timeout ho gaya:\n" + _clip(str(e), 3000)
         finally:
-            sb.terminate()
+            try:
+                await sb.terminate.aio()
+            except Exception:
+                pass
 
-    # Keep this return at the factory level, outside run_python().
-    # The deployed Modal service must receive the FastMCP instance.
+        return "\n".join(notes + [result])
+
+    # Ye return factory level pe hi rahe (run_python ke andar nahi).
+    # Deployed Modal service ko FastMCP instance chahiye.
     return mcp
 
 
-@app.function(image=image, timeout=600, secrets=[GOOGLE_DRIVE_SECRET])
+@app.function(
+    image=image,
+    timeout=600,
+    max_containers=MAX_CONTAINERS,
+    secrets=[AUTH_SECRET],
+)
 @modal.asgi_app()
 def web():
     from fastapi import FastAPI
+
+    token = os.environ.get("MCP_PATH_TOKEN", "").strip()
+    if len(token) < 16:
+        raise RuntimeError(
+            "MCP_PATH_TOKEN missing ya bahut chhota hai. "
+            "Modal secret 'mcp-auth' mein MCP_PATH_TOKEN (16+ chars) daalo."
+        )
 
     mcp = make_mcp_server()
 
@@ -123,7 +215,9 @@ def web():
 
     print(f"Starting Dynamic Python MCP {APP_VERSION}")
 
+    # Endpoint: /<token>/mcp  (bina token ke /mcp 404 dega)
     mcp_app = mcp.http_app(
+        path=f"/{token}/mcp",
         transport="streamable-http",
         stateless_http=True,
     )
